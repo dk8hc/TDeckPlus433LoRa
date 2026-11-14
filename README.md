@@ -60,3 +60,7 @@ Die Symbol-Kürzel entsprechen der primären APRS-Symboltabelle. Sie sendet jewe
 Der Sketch sendet TNC2-APRS-Text mit dem RadioLib-Header für APRS-over-LoRa (`3C FF 01`). Er ist nicht mit klassischem AX.25/AFSK auf 144.800 MHz kompatibel. LoRa-Frequenz und Modemparameter müssen zu den verwendeten APRS-over-LoRa-Gegenstellen passen.
 
 Die Hardware-Pins folgen der [LILYGO T-Deck Plus-Dokumentation](https://wiki.lilygo.cc/products/t-deck-series/t-deck-plus/): Display ST7789 über TFT_eSPI (Setup 210 in `User_Setup_Select.h`); Tastatur I²C-Adresse `0x55` an GPIO18/8 mit Interrupt GPIO46; Trackball GPIO3/2/15/1 plus Klick GPIO0; GPS UART1 mit ESP32-RX GPIO44 und TX GPIO43; I²S-Lautsprecher GPIO7 (BCK), GPIO5 (WS) und GPIO6 (DOUT).
+
+## Allgemeiner Hinweise
+
+Der Code wurde mit der Codex Anwendung von ChatGPT nach meinen Vorgaben erstellt, er kann Fehler enthalten, Nutzung auf eigene Gefahr
