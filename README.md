@@ -1,6 +1,6 @@
 # LoRa APRS für LILYGO T-Deck Plus
 
-Arduino-IDE-Sketch mit drei Displayseiten, Tastatur-/Trackballbedienung, LoRa-APRS-Nachrichten, Stationsentfernung und Richtung sowie GPS-/Stationsmeldungen.
+Arduino-IDE-Sketch mit vier Displayseiten, Tastatur-/Trackballbedienung, LoRa-APRS-Nachrichten, Stationsentfernung und Richtung sowie GPS-/Stationsmeldungen.
 
 ## Funktionen
 
