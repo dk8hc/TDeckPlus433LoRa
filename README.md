@@ -49,7 +49,7 @@ Arduino-IDE-Sketch mit drei Displayseiten, Tastatur-/Trackballbedienung, LoRa-AP
 5. Wähle **ESP32S3 Dev Module**. Der Sketch setzt die CPU beim Start auf 160 MHz. Weitere empfohlene Optionen: USB CDC On Boot Enabled, Flash 16 MB, PSRAM OPI, Partition Scheme 16M Flash (3MB APP/9.9MB FATFS), USB Mode Hardware CDC and JTAG.
 6. Lade den Sketch hoch. Bei Upload-Problemen Trackball-Mitte gedrückt halten und USB verbinden, dann hochladen und Reset drücken.
 
-Rufzeichen, Symbol, Kommentar und Status änderst du über die Einstellungsseite am Gerät. Der Startwert des Rufzeichens ist `DK8HC-11`.
+Rufzeichen, Symbol, Kommentar und Status änderst du über die Einstellungsseite am Gerät. Der Startwert des Rufzeichens ist `N0CALL-7`.
 
 SmartBeaconing-Standardwerte: Slow rate 10 min, Fast rate 60 s, Low/High speed 5/60 km/h, Turn angle 25°, Turn slope 255 (Grad·km/h) und Turn time 30 s. Zwischen zwei automatischen SmartBeacons liegen immer mindestens 30 Sekunden, auch wenn Fast Rate niedriger eingestellt ist. Die Werte werden nichtflüchtig gespeichert. Geschwindigkeitsintervalle folgen der klassischen Kurve `Fast rate × High speed ÷ aktuelle Geschwindigkeit`, begrenzt durch Slow/Fast rate und die Mindestpause. Die Kursänderungsschwelle ist `Turn angle + Turn slope ÷ Geschwindigkeit` und wird auf 120° begrenzt. Beaconing setzt einen aktuellen GPS-Fix voraus.
 
