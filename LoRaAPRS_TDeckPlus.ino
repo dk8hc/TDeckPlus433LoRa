@@ -13,7 +13,7 @@
 #include <TinyGPSPlus.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <driver/i2s.h>
+#include <ESP_I2S.h>
 #include "web_page.h"
 
 // T-Deck Plus pins, from the current LILYGO board documentation.
@@ -62,7 +62,7 @@ static const uint8_t FIRST_SYMBOL_PRESET = 12;
 static const uint8_t WIFI_MODE_SETTING = 19;
 static const uint8_t MAIN_SETTING_ITEMS[] = {0, 1, 2, 3, 4, 22, 23, 19, 20, 21};
 static const uint8_t MAIN_SETTING_COUNT = sizeof(MAIN_SETTING_ITEMS) / sizeof(MAIN_SETTING_ITEMS[0]);
-static const uint8_t DETAIL_SETTING_COUNT = 14; // settings 5 through 18
+static const uint8_t DETAIL_SETTING_COUNT = 17; // SmartBeacon, symbols, position options
 
 SX1262 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 TFT_eSPI *display = new TFT_eSPI();
@@ -106,6 +106,9 @@ uint16_t smartHighSpeedKmh = 60;
 uint16_t smartTurnAngleDeg = 25;
 uint16_t smartTurnSlope = 255;
 uint16_t smartTurnTimeSec = 30;
+bool beaconSpeedEnabled = false;
+bool beaconAltitudeEnabled = false;
+uint8_t positionPrecision = 0; // 0 exact, 1..4 APRS ambiguity levels
 float lastBeaconCourseDeg = 0.0f;
 bool lastBeaconCourseValid = false;
 
@@ -121,6 +124,7 @@ struct __attribute__((packed)) StoredRxMessage {
 static const uint32_t RX_MESSAGE_MARKER = 0x41505258; // "APRX"
 bool messageBeepActive = false;
 bool audioReady = false;
+I2SClass audioI2S(I2S_NUM_0);
 bool messageToneEnabled = true;
 bool batteryStatusEnabled = false;
 bool batteryReadingValid = false;
@@ -178,11 +182,29 @@ void IRAM_ATTR onTrackLeft() { --trackX; }
 void IRAM_ATTR onTrackClick() { ++trackClickFlag; }
 
 double parseCoord(const char *s, bool latitude) {
-  // APRS uncompressed DDMM.mmN / DDDMM.mmE
+  // APRS uncompressed DDMM.mmN / DDDMM.mmE. Ambiguous trailing minute
+  // digits are interpreted at the center of their reported area.
   int degDigits = latitude ? 2 : 3;
   int deg = 0;
   for (int i = 0; i < degDigits; ++i) deg = deg * 10 + (s[i] - '0');
-  double minutes = atof(s + degDigits);
+  int minuteDigits[4];
+  const int positions[] = {degDigits, degDigits + 1, degDigits + 3, degDigits + 4};
+  bool ambiguityStarted = false;
+  for (int i = 0; i < 4; ++i) {
+    char digit = s[positions[i]];
+    if (digit == ' ') ambiguityStarted = true;
+    minuteDigits[i] = digit == ' ' ? 0 : digit - '0';
+  }
+  // Replace the first ambiguous digit with 5 (the cell midpoint) and all
+  // following digits with 0, preserving any known leading digits.
+  ambiguityStarted = false;
+  for (int i = 0; i < 4; ++i) {
+    if (s[positions[i]] == ' ') ambiguityStarted = true;
+    if (ambiguityStarted) minuteDigits[i] = (s[positions[i]] == ' ' &&
+                                              (i == 0 || s[positions[i - 1]] != ' ')) ? 5 : 0;
+  }
+  double minutes = minuteDigits[0] * 10 + minuteDigits[1] +
+                   minuteDigits[2] / 10.0 + minuteDigits[3] / 100.0;
   double result = deg + minutes / 60.0;
   char hemi = s[degDigits + 5];
   if (hemi == 'S' || hemi == 'W') result = -result;
@@ -195,12 +217,29 @@ bool extractPosition(const char *info, double &lat, double &lon) {
   const char *p = info + 1;
   if (strlen(p) < 18) return false;
   for (int i = 0; i < 4; ++i) if (p[i] < '0' || p[i] > '9') return false;
-  if (p[4] != '.' || p[5] < '0' || p[5] > '9' || p[6] < '0' || p[6] > '9' ||
+  if (p[4] != '.' || (p[5] != ' ' && (p[5] < '0' || p[5] > '9')) ||
+      (p[6] != ' ' && (p[6] < '0' || p[6] > '9')) ||
       (p[7] != 'N' && p[7] != 'S')) return false;
-  if (p[9] < '0' || p[9] > '9' || p[10] < '0' || p[10] > '9' ||
-      p[11] < '0' || p[11] > '9' || p[12] < '0' || p[12] > '9' ||
-      p[13] < '0' || p[13] > '9' || p[14] != '.' ||
-      p[15] < '0' || p[15] > '9' || p[16] < '0' || p[16] > '9') return false;
+  for (int i = 9; i <= 13; ++i)
+    if (p[i] != ' ' && (p[i] < '0' || p[i] > '9')) return false;
+  if (p[14] != '.' || (p[15] != ' ' && (p[15] < '0' || p[15] > '9')) ||
+      (p[16] != ' ' && (p[16] < '0' || p[16] > '9'))) return false;
+  // APRS ambiguity is contiguous from least-significant to more-significant
+  // minute digits. Reject malformed fields with a digit after a blank.
+  const int latDigits[] = {6, 5, 3, 2};
+  bool blankSeen = false;
+  for (int i = 0; i < 4; ++i) {
+    char c = p[latDigits[i]];
+    if (c == ' ') blankSeen = true;
+    else if (blankSeen) return false;
+  }
+  const int lonDigits[] = {16, 15, 13, 12};
+  blankSeen = false;
+  for (int i = 0; i < 4; ++i) {
+    char c = p[lonDigits[i]];
+    if (c == ' ') blankSeen = true;
+    else if (blankSeen) return false;
+  }
   if (p[17] != 'E' && p[17] != 'W') return false;
   char a[9], b[10];
   memcpy(a, p, 8); a[8] = 0;
@@ -428,7 +467,8 @@ void startMessageBeep() {
   messageBeepActive = true;
   messageBeepStartedAt = millis();
   messageBeepSample = 0;
-  i2s_zero_dma_buffer(I2S_NUM_0);
+  const int16_t silence[64] = {};
+  audioI2S.write(silence, sizeof(silence));
   Serial.println("Audio: 1750-Hz-Piep gestartet (500 ms)");
 }
 
@@ -436,7 +476,8 @@ void serviceMessageBeep() {
   if (!messageBeepActive) return;
   if ((uint32_t)(millis() - messageBeepStartedAt) >= 500) {
     messageBeepActive = false;
-    i2s_zero_dma_buffer(I2S_NUM_0);
+    const int16_t silence[64] = {};
+    audioI2S.write(silence, sizeof(silence));
     return;
   }
 
@@ -449,10 +490,9 @@ void serviceMessageBeep() {
     samples[i * 2] = value;
     samples[i * 2 + 1] = value;
   }
-  size_t written = 0;
-  esp_err_t result = i2s_write(I2S_NUM_0, samples, sizeof(samples), &written, pdMS_TO_TICKS(12));
-  if (result != ESP_OK || written != sizeof(samples)) {
-    Serial.printf("Audio I2S Schreibfehler: %d, %u/%u Bytes\n", (int)result,
+  size_t written = audioI2S.write(samples, sizeof(samples));
+  if (written != sizeof(samples)) {
+    Serial.printf("Audio I2S Schreibfehler: %d, %u/%u Bytes\n", audioI2S.lastError(),
                   (unsigned)written, (unsigned)sizeof(samples));
   }
 }
@@ -575,17 +615,45 @@ void maybeAckMessage(const char *packet, const char *info) {
   sendPacket(ack);
 }
 
+void formatAprsCoordinate(double decimalDegrees, bool latitude, uint8_t ambiguity, char *out, size_t capacity) {
+  char hemisphere = latitude ? (decimalDegrees < 0 ? 'S' : 'N') : (decimalDegrees < 0 ? 'W' : 'E');
+  double absolute = fabs(decimalDegrees);
+  int degrees = (int)absolute;
+  double minutes = (absolute - degrees) * 60.0;
+  char value[10];
+  if (latitude) snprintf(value, sizeof(value), "%02d%05.2f%c", degrees, minutes, hemisphere);
+  else snprintf(value, sizeof(value), "%03d%05.2f%c", degrees, minutes, hemisphere);
+  int degreeDigits = latitude ? 2 : 3;
+  // APRS ambiguity is encoded by blanking progressively less-significant
+  // minute digits in both coordinates (0.1', 1', 10', then 1 degree).
+  if (ambiguity >= 1) value[degreeDigits + 4] = ' ';
+  if (ambiguity >= 2) value[degreeDigits + 3] = ' ';
+  if (ambiguity >= 3) value[degreeDigits + 1] = ' ';
+  if (ambiguity >= 4) value[degreeDigits] = ' ';
+  strncpy(out, value, capacity - 1);
+  out[capacity - 1] = 0;
+}
+
 void sendBeacon(bool manual = false) {
   if (!gps.location.isValid() || gps.location.age() > GPS_STALE_MS) { Serial.println("Beacon ausgesetzt: GPS-Position nicht aktuell."); return; }
-  char lat[10], lon[11], packet[180];
-  double la = fabs(gps.location.lat()), lo = fabs(gps.location.lng());
-  int latDeg = (int)la, lonDeg = (int)lo;
-  double latMin = (la - latDeg) * 60.0, lonMin = (lo - lonDeg) * 60.0;
-  snprintf(lat, sizeof(lat), "%02d%05.2f%c", latDeg, latMin, gps.location.lat() < 0 ? 'S' : 'N');
-  snprintf(lon, sizeof(lon), "%03d%05.2f%c", lonDeg, lonMin, gps.location.lng() < 0 ? 'W' : 'E');
-  snprintf(packet, sizeof(packet), "%s>APLTDP,%s:= %s/%s%c%s", myCallsign, APRS_PATH, lat, lon, stationSymbol, stationComment);
-  // Remove the formatting space after '=': APRS position starts immediately.
-  char *p = strstr(packet, ":= "); if (p) memmove(p + 2, p + 3, strlen(p + 3) + 1);
+  char lat[10], lon[11], speedExtension[10] = "", altitudeExtension[16] = "", packet[220];
+  formatAprsCoordinate(gps.location.lat(), true, positionPrecision, lat, sizeof(lat));
+  formatAprsCoordinate(gps.location.lng(), false, positionPrecision, lon, sizeof(lon));
+  if (beaconSpeedEnabled && gps.speed.isValid() && gps.speed.age() < GPS_STALE_MS) {
+    int course = 0;
+    if (gps.course.isValid() && gps.course.age() < GPS_STALE_MS) {
+      course = (int)lround(gps.course.deg());
+      if (course >= 360) course = 0;
+    }
+    int speedKnots = constrain((int)lround(gps.speed.kmph() / 1.852), 0, 999);
+    snprintf(speedExtension, sizeof(speedExtension), "%03d/%03d", course, speedKnots);
+  }
+  if (beaconAltitudeEnabled && gps.altitude.isValid() && gps.altitude.age() < GPS_STALE_MS && gps.altitude.meters() >= 0) {
+    unsigned long altitudeFeet = min((unsigned long)999999, (unsigned long)lround(gps.altitude.meters() * 3.28084));
+    snprintf(altitudeExtension, sizeof(altitudeExtension), "/A=%06lu", altitudeFeet);
+  }
+  snprintf(packet, sizeof(packet), "%s>APLTDP,%s:=%s/%s%c%s%s%s", myCallsign, APRS_PATH,
+           lat, lon, stationSymbol, speedExtension, altitudeExtension, stationComment);
   bool positionSent = sendPacket(packet);
   if (positionSent) ++positionBeaconCount;
   lastBeacon = millis();
@@ -711,6 +779,9 @@ void loadSettings() {
   smartTurnAngleDeg = prefs.getUShort("sb_angle", 25);
   smartTurnSlope = prefs.getUShort("sb_slope", 255);
   smartTurnTimeSec = max((uint16_t)30, prefs.getUShort("sb_time", 30));
+  beaconSpeedEnabled = prefs.getBool("tx_speed", false);
+  beaconAltitudeEnabled = prefs.getBool("tx_alt", false);
+  positionPrecision = min((uint8_t)4, prefs.getUChar("pos_precision", 0));
   messageToneEnabled = prefs.getBool("tone_on", true);
   batteryStatusEnabled = prefs.getBool("bat_status", false);
   if (!myCallsign[0]) strcpy(myCallsign, DEFAULT_CALLSIGN);
@@ -734,6 +805,9 @@ void saveSettings() {
   prefs.putUShort("sb_angle", smartTurnAngleDeg);
   prefs.putUShort("sb_slope", smartTurnSlope);
   prefs.putUShort("sb_time", smartTurnTimeSec);
+  prefs.putBool("tx_speed", beaconSpeedEnabled);
+  prefs.putBool("tx_alt", beaconAltitudeEnabled);
+  prefs.putUChar("pos_precision", positionPrecision);
   prefs.putBool("tone_on", messageToneEnabled);
   prefs.putBool("bat_status", batteryStatusEnabled);
   prefs.end();
@@ -824,7 +898,8 @@ void activateSetting() {
     messageToneEnabled = !messageToneEnabled;
     if (!messageToneEnabled && audioReady) {
       messageBeepActive = false;
-      i2s_zero_dma_buffer(I2S_NUM_0);
+      const int16_t silence[64] = {};
+      audioI2S.write(silence, sizeof(silence));
     }
     saveSettings();
     uiDirty = true;
@@ -839,7 +914,19 @@ void activateSetting() {
 
 void activateSelectedSetting() {
   if (currentPage == 2) settingsSelection = MAIN_SETTING_ITEMS[settingsMenuSelection];
-  else if (currentPage == 3) settingsSelection = 5 + detailsSelection;
+  else if (currentPage == 3) {
+    if (detailsSelection < 14) {
+      settingsSelection = 5 + detailsSelection;
+      activateSetting();
+      return;
+    }
+    if (detailsSelection == 14) beaconSpeedEnabled = !beaconSpeedEnabled;
+    else if (detailsSelection == 15) beaconAltitudeEnabled = !beaconAltitudeEnabled;
+    else positionPrecision = (positionPrecision + 1) % 5;
+    saveSettings();
+    uiDirty = true;
+    return;
+  }
   activateSetting();
 }
 
@@ -985,7 +1072,8 @@ void handleWebTone() {
   messageToneEnabled = enabled == "1";
   if (!messageToneEnabled && audioReady) {
     messageBeepActive = false;
-    i2s_zero_dma_buffer(I2S_NUM_0);
+    const int16_t silence[64] = {};
+    audioI2S.write(silence, sizeof(silence));
   }
   saveSettings();
   uiDirty = true;
@@ -1427,32 +1515,49 @@ void drawDetails() {
   static const char *labels[DETAIL_SETTING_COUNT] = {
     "Slow rate min", "Fast rate s", "Low speed km/h", "High speed km/h",
     "Turn angle deg", "Turn slope", "Turn time s", "Telefon /$", "Auto />",
-    "Van /v", "LKW /k", "Mensch /[", "Trecker /F", "Schiff /s"
+    "Van /v", "LKW /k", "Mensch /[", "Trecker /F", "Schiff /s",
+    "Tempo", "Hoehe", "Genauigkeit"
   };
-  bool symbolGroup = detailsSelection >= 7;
-  uint8_t groupSelection = symbolGroup ? detailsSelection - 7 : detailsSelection;
+  uint8_t section = detailsSelection < 7 ? 0 : (detailsSelection < 14 ? 1 : 2);
+  uint8_t sectionStart = section == 0 ? 0 : (section == 1 ? 7 : 14);
+  uint8_t sectionCount = section == 2 ? 3 : 7;
+  uint8_t groupSelection = detailsSelection - sectionStart;
   uint8_t first = groupSelection > 4 ? groupSelection - 4 : 0;
   display->setTextSize(1); display->setTextColor(C_CYAN, C_BG);
-  display->setCursor(8, 43); display->print(symbolGroup ? "APRS Symbol:" : "SmartBeaconing:");
-  for (int row = 0; row < 5 && first + row < 7; ++row) {
-    uint8_t groupItem = first + row;
-    uint8_t item = symbolGroup ? groupItem + 7 : groupItem;
-    uint8_t setting = 5 + item;
+  display->setCursor(8, 43);
+  if (section == 0) display->print("SmartBeaconing:");
+  else if (section == 1) display->print("APRS Symbol:");
+  else display->print("Positionsgenauigkeit:");
+  for (int row = 0; row < 5 && first + row < sectionCount; ++row) {
+    uint8_t item = sectionStart + first + row;
     int y = 61 + row * 26;
     bool selected = item == detailsSelection;
     if (selected) display->fillRoundRect(4, y - 2, 312, 29, 4, C_PANEL);
     display->setTextSize(1); display->setTextColor(selected ? C_YELLOW : C_MUTED, selected ? C_PANEL : C_BG);
     display->setCursor(9, y + 3); display->print(labels[item]);
     display->setTextColor(C_WHITE, selected ? C_PANEL : C_BG); display->setCursor(157, y + 3);
-    switch (setting) {
-      case 5: display->printf("%u", smartSlowRateMin); break;
-      case 6: display->printf("%u", smartFastRateSec); break;
-      case 7: display->printf("%u", smartLowSpeedKmh); break;
-      case 8: display->printf("%u", smartHighSpeedKmh); break;
-      case 9: display->printf("%u", smartTurnAngleDeg); break;
-      case 10: display->printf("%u", smartTurnSlope); break;
-      case 11: display->printf("%u", smartTurnTimeSec); break;
-      default: display->print(stationSymbol == presetSymbolCode(setting) ? "AKTIV" : "setzen"); break;
+    if (section == 0) {
+      switch (item) {
+        case 0: display->printf("%u", smartSlowRateMin); break;
+        case 1: display->printf("%u", smartFastRateSec); break;
+        case 2: display->printf("%u", smartLowSpeedKmh); break;
+        case 3: display->printf("%u", smartHighSpeedKmh); break;
+        case 4: display->printf("%u", smartTurnAngleDeg); break;
+        case 5: display->printf("%u", smartTurnSlope); break;
+        case 6: display->printf("%u", smartTurnTimeSec); break;
+      }
+    } else if (section == 1) {
+      uint8_t setting = 5 + item;
+      display->print(stationSymbol == presetSymbolCode(setting) ? "AKTIV" : "setzen");
+    } else if (item == 14) {
+      display->print(beaconSpeedEnabled ? "Ja" : "Nein");
+    } else if (item == 15) {
+      display->print(beaconAltitudeEnabled ? "Ja" : "Nein");
+    } else {
+      static const char *precisionLabels[] = {
+        "DD\xB0 MM.mm'", "DD\xB0 MM.m'", "DD\xB0 MM'", "DD\xB0 Mx'", "DD\xB0"
+      };
+      display->print(precisionLabels[positionPrecision]);
     }
     if (editMode && selected) {
       display->setTextColor(C_CYAN, C_PANEL); display->setCursor(157, y + 15);
@@ -1492,27 +1597,10 @@ void setup() {
   Serial.println("BOOT: GPIO10 HIGH gesetzt");
   delay(200);
   Serial.println("BOOT: Peripherie-Strom an");
-  i2s_config_t audioConfig = {};
-  audioConfig.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
-  audioConfig.sample_rate = 28000;
-  audioConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
-  audioConfig.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
-  audioConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-  audioConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-  audioConfig.dma_buf_count = 4;
-  audioConfig.dma_buf_len = 256;
-  audioConfig.use_apll = false;
-  esp_err_t audioState = i2s_driver_install(I2S_NUM_0, &audioConfig, 0, nullptr);
-  if (audioState == ESP_OK) {
-    i2s_pin_config_t audioPins = {};
-    audioPins.bck_io_num = PIN_I2S_BCK;
-    audioPins.ws_io_num = PIN_I2S_WS;
-    audioPins.data_out_num = PIN_I2S_DOUT;
-    audioPins.data_in_num = I2S_PIN_NO_CHANGE;
-    audioState = i2s_set_pin(I2S_NUM_0, &audioPins);
-  }
-  audioReady = audioState == ESP_OK;
-  Serial.printf("I2S Audio: %s\n", audioState == ESP_OK ? "bereit" : "nicht verfuegbar");
+  audioI2S.setPins(PIN_I2S_BCK, PIN_I2S_WS, PIN_I2S_DOUT);
+  audioReady = audioI2S.begin(I2S_MODE_STD, 28000, I2S_DATA_BIT_WIDTH_16BIT,
+                              I2S_SLOT_MODE_STEREO);
+  Serial.printf("I2S Audio: %s\n", audioReady ? "bereit" : "nicht verfuegbar");
   pinMode(PIN_TFT_CS, OUTPUT); digitalWrite(PIN_TFT_CS, HIGH);
   pinMode(PIN_SD_CS, OUTPUT); digitalWrite(PIN_SD_CS, HIGH);
   pinMode(PIN_LORA_CS, OUTPUT); digitalWrite(PIN_LORA_CS, HIGH);
