@@ -53,6 +53,7 @@ static const uint8_t LORA_SYNC_WORD = RADIOLIB_SX126X_SYNC_WORD_PRIVATE;
 static const int8_t LORA_TX_DBM = 10;
 
 static const char DEFAULT_CALLSIGN[] = "N0CALL-7"; // Editable in the settings page
+static const char APRS_TO_CALL[] = "APZ8HC";
 static const char APRS_PATH[] = "WIDE1-1";
 static const uint32_t BEACON_INTERVAL_MS = 180000;
 static const uint32_t DISPLAY_IDLE_TIMEOUT_MS = 60000;
@@ -60,9 +61,11 @@ static const uint32_t GPS_STALE_MS = 120000;
 static const uint32_t SMART_BEACON_MIN_GAP_MS = 30000;
 static const uint8_t FIRST_SYMBOL_PRESET = 12;
 static const uint8_t WIFI_MODE_SETTING = 19;
-static const uint8_t MAIN_SETTING_ITEMS[] = {0, 1, 2, 3, 4, 22, 23, 19, 20, 21};
+static const uint8_t APRSIS_SETTING = 24;
+static const uint8_t KEY_LOCK_SETTING = 28;
+static const uint8_t MAIN_SETTING_ITEMS[] = {0, 1, 2, 3, 4, 22, 23, 19, 20, 21, APRSIS_SETTING, KEY_LOCK_SETTING};
 static const uint8_t MAIN_SETTING_COUNT = sizeof(MAIN_SETTING_ITEMS) / sizeof(MAIN_SETTING_ITEMS[0]);
-static const uint8_t DETAIL_SETTING_COUNT = 17; // SmartBeacon, symbols, position options
+static const uint8_t DETAIL_SETTING_COUNT = 22; // SmartBeacon, symbols, position options, APRS-IS
 
 SX1262 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RST, PIN_LORA_BUSY);
 TFT_eSPI *display = new TFT_eSPI();
@@ -70,6 +73,7 @@ TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
 Preferences prefs;
 WebServer webServer(80);
+WiFiClient aprsIsClient;
 bool webRoutesConfigured = false;
 bool webServerStarted = false;
 enum WifiProfileMode : uint8_t { WLAN_OFF = 0, WLAN_AP = 1, WLAN_CLIENT = 2 };
@@ -77,6 +81,19 @@ uint8_t wifiMode = WLAN_OFF;
 char wifiSsid[33] = "TDeck-AP";
 char wifiPassword[64] = "";
 int lastWifiStatus = -1;
+bool aprsIsEnabled = false;
+bool aprsIsBeaconEnabled = false;
+bool aprsIsRxGateEnabled = true;
+bool aprsIsUiConnected = false;
+char aprsIsServer[64] = "rotate.aprs2.net";
+char aprsIsPasscode[8] = "";
+uint8_t aprsIsRadiusKm = 50;
+char aprsIsRxLine[513];
+size_t aprsIsRxLength = 0;
+bool aprsIsDiscardLine = false;
+uint32_t aprsIsReconnectAt = 0;
+uint32_t aprsIsLastStatusAt = 0;
+double aprsIsFilterLat = 999.0, aprsIsFilterLon = 999.0;
 char myCallsign[10];
 char stationComment[48];
 char stationStatus[48];
@@ -88,15 +105,25 @@ uint32_t rxCount = 0;
 char inputLine[180];
 size_t inputLen = 0;
 
-struct Station { char call[16]; double lat, lon; bool hasPos; uint32_t heardAt; } stations[16];
+static const uint8_t MAX_STATIONS = 50;
+static const uint8_t MAX_MESSAGES = 200;
+struct Station { char call[16]; double lat, lon; bool hasPos; uint32_t heardAt; uint32_t timestamp; } stations[MAX_STATIONS];
 uint8_t stationCount = 0;
 struct __attribute__((packed)) StoredStation {
   uint32_t marker;
   char call[16];
   double lat, lon;
   uint8_t hasPos;
+  uint32_t timestamp;
 };
-static const uint32_t STATION_MARKER = 0x41505253; // "APRS"
+struct __attribute__((packed)) StoredStationV1 {
+  uint32_t marker;
+  char call[16];
+  double lat, lon;
+  uint8_t hasPos;
+};
+static const uint32_t STATION_MARKER = 0x41505254; // New record format with UTC timestamp.
+static const uint32_t STATION_MARKER_V1 = 0x41505253;
 static const char STATION_LOG_PATH[] = "/aprs_stations.bin";
 bool smartBeaconEnabled = true;
 uint16_t smartSlowRateMin = 10;
@@ -112,7 +139,7 @@ uint8_t positionPrecision = 0; // 0 exact, 1..4 APRS ambiguity levels
 float lastBeaconCourseDeg = 0.0f;
 bool lastBeaconCourseValid = false;
 
-struct AprsMessage { char from[16]; char text[100]; bool outgoing; bool acked; } messages[12];
+struct AprsMessage { char from[16]; char text[100]; uint32_t timestamp; bool outgoing; bool acked; } messages[MAX_MESSAGES];
 uint8_t messageCount = 0;
 bool sdReady = false;
 static const char MESSAGE_LOG_PATH[] = "/aprs_rx.bin";
@@ -120,13 +147,26 @@ struct __attribute__((packed)) StoredRxMessage {
   uint32_t marker;
   char from[16];
   char text[100];
+  uint32_t timestamp;
 };
-static const uint32_t RX_MESSAGE_MARKER = 0x41505258; // "APRX"
+struct __attribute__((packed)) StoredRxMessageV1 {
+  uint32_t marker;
+  char from[16];
+  char text[100];
+};
+static const uint32_t RX_MESSAGE_MARKER = 0x41505259; // New record format with UTC timestamp.
+static const uint32_t RX_MESSAGE_MARKER_V1 = 0x41505258;
 bool messageBeepActive = false;
 bool audioReady = false;
 I2SClass audioI2S(I2S_NUM_0);
 bool messageToneEnabled = true;
 bool batteryStatusEnabled = false;
+uint8_t keyLockTimeoutSeconds = 0;
+bool keyboardLocked = false;
+uint8_t keyLockSequenceStage = 0;
+uint32_t keyLockSequenceDeadline = 0;
+uint32_t keyLockPromptUntil = 0;
+uint32_t lastPhysicalInputAt = 0;
 bool batteryReadingValid = false;
 float batteryVoltage = 0.0f;
 uint8_t batteryPercent = 0;
@@ -174,6 +214,13 @@ void wakeDisplay();
 void updateBatteryReading();
 void drawBatteryIndicator();
 void applyBatteryCpuFrequency();
+void serviceAprsIs();
+void stopAprsIs();
+bool sendOwnPacketToAprsIs(const char *packet);
+void forwardLoRaPacketToAprsIs(const char *source, const char *gt, const char *colon);
+void serviceKeyLock();
+void showKeyLockPrompt();
+void handleLockedKey(char key);
 
 void IRAM_ATTR onTrackUp() { ++trackY; }
 void IRAM_ATTR onTrackRight() { ++trackX; }
@@ -211,10 +258,56 @@ double parseCoord(const char *s, bool latitude) {
   return result;
 }
 
+uint32_t currentGpsTimestamp() {
+  if (!gps.date.isValid() || !gps.time.isValid() ||
+      gps.date.age() > GPS_STALE_MS || gps.time.age() > GPS_STALE_MS) return 0;
+  int year = gps.date.year();
+  unsigned month = gps.date.month(), day = gps.date.day();
+  if (year < 1970 || year > 2106 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned yearOfEra = (unsigned)(year - era * 400);
+  const unsigned adjustedMonth = month > 2 ? month - 3 : month + 9;
+  const unsigned dayOfYear = (153 * adjustedMonth + 2) / 5 + day - 1;
+  const unsigned dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+  const int64_t daysSinceEpoch = (int64_t)era * 146097 + dayOfEra - 719468;
+  uint64_t seconds = (uint64_t)daysSinceEpoch * 86400ULL +
+                     gps.time.hour() * 3600UL + gps.time.minute() * 60UL + gps.time.second();
+  return seconds <= UINT32_MAX ? (uint32_t)seconds : 0;
+}
+
+void utcDateTimeFields(uint32_t timestamp, int &year, unsigned &month, unsigned &day,
+                       unsigned &hour, unsigned &minute, unsigned &second) {
+  uint32_t days = timestamp / 86400UL;
+  uint32_t daySeconds = timestamp % 86400UL;
+  hour = daySeconds / 3600UL;
+  minute = (daySeconds / 60UL) % 60UL;
+  second = daySeconds % 60UL;
+  int64_t z = (int64_t)days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned dayOfEra = (unsigned)(z - era * 146097);
+  unsigned yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365;
+  year = (int)yearOfEra + (int)(era * 400);
+  unsigned dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100);
+  unsigned monthPrime = (5 * dayOfYear + 2) / 153;
+  day = dayOfYear - (153 * monthPrime + 2) / 5 + 1;
+  month = monthPrime < 10 ? monthPrime + 3 : monthPrime - 9;
+  year += month <= 2;
+}
+
+void formatCompactUtcTimestamp(uint32_t timestamp, char *out, size_t capacity) {
+  if (!capacity) return;
+  if (!timestamp) { snprintf(out, capacity, "--.-- --:--Z"); return; }
+  int year; unsigned month, day, hour, minute, second;
+  utcDateTimeFields(timestamp, year, month, day, hour, minute, second);
+  snprintf(out, capacity, "%02u.%02u %02u:%02uZ", day, month, hour, minute);
+}
+
 bool extractPosition(const char *info, double &lat, double &lon) {
-  // Supports APRS uncompressed position reports beginning with ! or =.
-  if (info[0] != '!' && info[0] != '=') return false;
+  // Supports APRS uncompressed positions with or without a timestamp.
   const char *p = info + 1;
+  if (info[0] == '/' || info[0] == '@') p += 7;
+  else if (info[0] != '!' && info[0] != '=') return false;
   if (strlen(p) < 18) return false;
   for (int i = 0; i < 4; ++i) if (p[i] < '0' || p[i] > '9') return false;
   if (p[4] != '.' || (p[5] != ' ' && (p[5] < '0' || p[5] > '9')) ||
@@ -250,13 +343,44 @@ bool extractPosition(const char *info, double &lat, double &lon) {
 
 int findStation(const char *call) {
   for (int i = 0; i < stationCount; ++i) if (!strcmp(stations[i].call, call)) return i;
-  if (stationCount >= 16) { memmove(stations, stations + 1, sizeof(stations[0]) * 15); --stationCount; }
+  if (stationCount >= MAX_STATIONS) {
+    memmove(stations, stations + 1, sizeof(stations[0]) * (MAX_STATIONS - 1));
+    --stationCount;
+  }
   int n = stationCount++;
   strncpy(stations[n].call, call, sizeof(stations[n].call) - 1);
   stations[n].call[sizeof(stations[n].call) - 1] = 0;
   stations[n].hasPos = false;
   stations[n].heardAt = millis();
+  stations[n].timestamp = 0;
   return n;
+}
+
+bool stationIsNewer(int a, int b) {
+  const Station &left = stations[a];
+  const Station &right = stations[b];
+  if (left.heardAt && right.heardAt) {
+    uint32_t elapsed = left.heardAt - right.heardAt;
+    if (elapsed && elapsed != 0x80000000UL) return (int32_t)elapsed > 0;
+  } else if (left.heardAt != right.heardAt) {
+    return left.heardAt != 0; // Stations heard this session precede restored entries.
+  }
+  if (left.timestamp && right.timestamp && left.timestamp != right.timestamp)
+    return left.timestamp > right.timestamp;
+  if (left.timestamp != right.timestamp) return left.timestamp != 0;
+  // Persisted records retain oldest-to-newest order when no valid GPS time exists.
+  return a > b;
+}
+
+void getStationOrderNewestFirst(int *order) {
+  for (int i = 0; i < stationCount; ++i) {
+    int j = i;
+    while (j > 0 && stationIsNewer(i, order[j - 1])) {
+      order[j] = order[j - 1];
+      --j;
+    }
+    order[j] = i;
+  }
 }
 
 void cleanSource(const char *packet, char *out, size_t cap) {
@@ -270,54 +394,77 @@ void cleanSource(const char *packet, char *out, size_t cap) {
   }
 }
 
-void storeMessage(const char *from, const char *text, bool outgoing) {
-  if (messageCount >= 12) { memmove(messages, messages + 1, sizeof(messages[0]) * 11); --messageCount; }
+void storeMessage(const char *from, const char *text, bool outgoing, uint32_t timestamp = 0) {
+  if (messageCount >= MAX_MESSAGES) {
+    memmove(messages, messages + 1, sizeof(messages[0]) * (MAX_MESSAGES - 1));
+    --messageCount;
+  }
   AprsMessage &m = messages[messageCount++];
   strncpy(m.from, from, sizeof(m.from) - 1); m.from[sizeof(m.from) - 1] = 0;
   strncpy(m.text, text, sizeof(m.text) - 1); m.text[sizeof(m.text) - 1] = 0;
+  m.timestamp = timestamp;
   m.outgoing = outgoing; m.acked = false;
-  messageSelection = messageCount - 1;
+  messageSelection = 0; // Selection is a newest-first visual rank.
   uiDirty = true;
 }
 
-void persistReceivedMessage(const char *from, const char *text) {
+bool rewriteReceivedMessageLog();
+
+void persistReceivedMessage(const char *from, const char *text, uint32_t timestamp) {
   if (!sdReady) return;
   StoredRxMessage record = {};
   record.marker = RX_MESSAGE_MARKER;
   strncpy(record.from, from, sizeof(record.from) - 1);
   strncpy(record.text, text, sizeof(record.text) - 1);
+  record.timestamp = timestamp;
   File file = SD.open(MESSAGE_LOG_PATH, FILE_APPEND);
   if (!file) {
     Serial.println("SD: Nachrichtenprotokoll kann nicht geoeffnet werden");
     return;
   }
   size_t written = file.write((const uint8_t *)&record, sizeof(record));
+  size_t logSize = file.size();
   file.flush();
   file.close();
   if (written != sizeof(record)) Serial.println("SD: Nachricht konnte nicht vollstaendig gespeichert werden");
+  else if (logSize > sizeof(record) * (size_t)MAX_MESSAGES && !rewriteReceivedMessageLog())
+    Serial.println("SD: Nachrichtenarchiv konnte nicht auf 200 Eintraege begrenzt werden");
 }
 
 void loadReceivedMessages() {
   if (!sdReady) return;
   File file = SD.open(MESSAGE_LOG_PATH, FILE_READ);
   if (!file) return; // First boot or no messages yet.
-  const size_t recordSize = sizeof(StoredRxMessage);
   size_t total = file.size();
-  size_t start = total > recordSize * 12 ? total - recordSize * 12 : 0;
+  uint32_t firstMarker = 0;
+  if (file.read((uint8_t *)&firstMarker, sizeof(firstMarker)) != sizeof(firstMarker)) { file.close(); return; }
+  bool legacy = firstMarker == RX_MESSAGE_MARKER_V1;
+  size_t recordSize = legacy ? sizeof(StoredRxMessageV1) : sizeof(StoredRxMessage);
+  if (!legacy && firstMarker != RX_MESSAGE_MARKER) { file.close(); return; }
+  size_t start = total > recordSize * MAX_MESSAGES ? total - recordSize * MAX_MESSAGES : 0;
   // Align to a record boundary so a partially written final record is ignored.
   start = (start / recordSize) * recordSize;
   file.seek(start);
   while (file.available() >= (int)recordSize) {
-    StoredRxMessage record;
-    if (file.read((uint8_t *)&record, recordSize) != recordSize) break;
-    if (record.marker != RX_MESSAGE_MARKER || !memchr(record.from, 0, sizeof(record.from)) ||
-        !memchr(record.text, 0, sizeof(record.text))) continue;
-    storeMessage(record.from, record.text, false);
+    if (legacy) {
+      StoredRxMessageV1 oldRecord;
+      if (file.read((uint8_t *)&oldRecord, recordSize) != recordSize) break;
+      if (oldRecord.marker != RX_MESSAGE_MARKER_V1 || !memchr(oldRecord.from, 0, sizeof(oldRecord.from)) ||
+          !memchr(oldRecord.text, 0, sizeof(oldRecord.text))) continue;
+      storeMessage(oldRecord.from, oldRecord.text, false, 0);
+    } else {
+      StoredRxMessage record;
+      if (file.read((uint8_t *)&record, recordSize) != recordSize) break;
+      if (record.marker != RX_MESSAGE_MARKER || !memchr(record.from, 0, sizeof(record.from)) ||
+          !memchr(record.text, 0, sizeof(record.text))) continue;
+      storeMessage(record.from, record.text, false, record.timestamp);
+    }
   }
   file.close();
   if (messageCount) {
-    messageSelection = messageCount - 1;
+    messageSelection = 0;
     Serial.printf("SD: %u empfangene Nachrichten wiederhergestellt\n", messageCount);
+    if (legacy && !rewriteReceivedMessageLog()) Serial.println("SD: Altes Nachrichtenformat konnte nicht migriert werden");
   }
 }
 
@@ -335,6 +482,7 @@ bool rewriteReceivedMessageLog() {
     record.marker = RX_MESSAGE_MARKER;
     strncpy(record.from, messages[i].from, sizeof(record.from) - 1);
     strncpy(record.text, messages[i].text, sizeof(record.text) - 1);
+    record.timestamp = messages[i].timestamp;
     if (file.write((const uint8_t *)&record, sizeof(record)) != sizeof(record)) ok = false;
   }
   file.flush();
@@ -370,7 +518,7 @@ bool rewriteStationLog() {
   SD.remove(tempPath);
   File file = SD.open(tempPath, FILE_WRITE);
   if (!file) return false;
-  int order[16];
+  int order[MAX_STATIONS];
   for (int i = 0; i < stationCount; ++i) {
     int j = i;
     while (j > 0 && stations[order[j - 1]].heardAt > stations[i].heardAt) {
@@ -379,7 +527,7 @@ bool rewriteStationLog() {
     }
     order[j] = i;
   }
-  int first = stationCount > 10 ? stationCount - 10 : 0;
+  int first = stationCount > MAX_STATIONS ? stationCount - MAX_STATIONS : 0;
   bool ok = true;
   for (int n = first; n < stationCount; ++n) {
     Station &station = stations[order[n]];
@@ -389,6 +537,7 @@ bool rewriteStationLog() {
     record.lat = station.lat;
     record.lon = station.lon;
     record.hasPos = station.hasPos ? 1 : 0;
+    record.timestamp = station.timestamp;
     if (file.write((const uint8_t *)&record, sizeof(record)) != sizeof(record)) ok = false;
   }
   file.flush();
@@ -409,20 +558,40 @@ void loadStationLog() {
   if (!sdReady) return;
   File file = SD.open(STATION_LOG_PATH, FILE_READ);
   if (!file) return;
-  while (stationCount < 10 && file.available() >= (int)sizeof(StoredStation)) {
-    StoredStation record;
-    if (file.read((uint8_t *)&record, sizeof(record)) != sizeof(record)) break;
-    if (record.marker != STATION_MARKER || !memchr(record.call, 0, sizeof(record.call))) continue;
-    Station &station = stations[stationCount++];
+  uint32_t firstMarker = 0;
+  if (file.read((uint8_t *)&firstMarker, sizeof(firstMarker)) != sizeof(firstMarker)) { file.close(); return; }
+  bool legacy = firstMarker == STATION_MARKER_V1;
+  if (!legacy && firstMarker != STATION_MARKER) { file.close(); return; }
+  file.seek(0);
+  while (stationCount < MAX_STATIONS) {
+    Station &station = stations[stationCount];
     memset(&station, 0, sizeof(station));
-    strncpy(station.call, record.call, sizeof(station.call) - 1);
-    station.lat = record.lat;
-    station.lon = record.lon;
-    station.hasPos = record.hasPos != 0;
+    if (legacy) {
+      if (file.available() < (int)sizeof(StoredStationV1)) break;
+      StoredStationV1 record;
+      if (file.read((uint8_t *)&record, sizeof(record)) != sizeof(record)) break;
+      if (record.marker != STATION_MARKER_V1 || !memchr(record.call, 0, sizeof(record.call))) continue;
+      strncpy(station.call, record.call, sizeof(station.call) - 1);
+      station.lat = record.lat;
+      station.lon = record.lon;
+      station.hasPos = record.hasPos != 0;
+    } else {
+      if (file.available() < (int)sizeof(StoredStation)) break;
+      StoredStation record;
+      if (file.read((uint8_t *)&record, sizeof(record)) != sizeof(record)) break;
+      if (record.marker != STATION_MARKER || !memchr(record.call, 0, sizeof(record.call))) continue;
+      strncpy(station.call, record.call, sizeof(station.call) - 1);
+      station.lat = record.lat;
+      station.lon = record.lon;
+      station.hasPos = record.hasPos != 0;
+      station.timestamp = record.timestamp;
+    }
     station.heardAt = 0; // Restored stations appear older than stations heard this session.
+    ++stationCount;
   }
   file.close();
   if (stationCount) Serial.printf("SD: %u Stationen wiederhergestellt\n", stationCount);
+  if (legacy && stationCount && !rewriteStationLog()) Serial.println("SD: Altes Stationsformat konnte nicht migriert werden");
 }
 
 bool deleteStationAt(uint8_t index) {
@@ -454,7 +623,8 @@ void startReplyToSelectedMessage() {
     composeTo[0] = 0;
   } else {
     if (messageSelection >= messageCount) messageSelection = messageCount - 1;
-    strncpy(composeTo, messages[messageSelection].from, sizeof(composeTo) - 1);
+    uint8_t messageIndex = messageCount - 1 - messageSelection;
+    strncpy(composeTo, messages[messageIndex].from, sizeof(composeTo) - 1);
     composeTo[sizeof(composeTo) - 1] = 0;
     composeStage = 2;  // Skip recipient entry; start directly in the reply text.
   }
@@ -508,7 +678,7 @@ void copyMessageTextForDisplay(const char *source, char *dest, size_t capacity) 
   dest[length] = '\0';
 }
 
-void showPacket(const char *packet, int rssi, float snr) {
+void showPacket(const char *packet, int rssi, float snr, bool fromAprsIs = false) {
   wakeDisplay();
   bool beepAfterPacketHandling = false;
   char src[16] = "?", info[160] = "";
@@ -524,9 +694,11 @@ void showPacket(const char *packet, int rssi, float snr) {
   double lat, lon;
   int ix = findStation(src);
   stations[ix].heardAt = millis();
+  stations[ix].timestamp = currentGpsTimestamp();
   if (extractPosition(info, lat, lon)) { stations[ix].lat = lat; stations[ix].lon = lon; stations[ix].hasPos = true; }
   if (sdReady && !rewriteStationLog()) Serial.println("SD: Stationsliste konnte nicht gespeichert werden");
-  Serial.printf("\nRX %s  RSSI %d dBm  SNR %.1f dB\n%s\n", packet, rssi, snr, packet);
+  if (fromAprsIs) Serial.printf("\nAPRS-IS RX %s\n", packet);
+  else Serial.printf("\nRX %s  RSSI %d dBm  SNR %.1f dB\n%s\n", packet, rssi, snr, packet);
   if (stations[ix].hasPos) {
     Serial.printf("  Position: %.5f, %.5f", stations[ix].lat, stations[ix].lon);
     if (gps.location.isValid() && gps.location.age() < GPS_STALE_MS) {
@@ -549,12 +721,14 @@ void showPacket(const char *packet, int rssi, float snr) {
         if (messages[i].outgoing && strstr(messages[i].text, suffix)) messages[i].acked = true;
       }
     } else if (strcasecmp(target, myCallsign) == 0) {
-      storeMessage(src, visibleText, false);
-      persistReceivedMessage(src, visibleText);
+      uint32_t timestamp = currentGpsTimestamp();
+      storeMessage(src, visibleText, false, timestamp);
+      persistReceivedMessage(src, visibleText, timestamp);
       beepAfterPacketHandling = true;
     }
   }
   maybeAckMessage(packet, info);
+  if (!fromAprsIs) forwardLoRaPacketToAprsIs(src, gt, colon);
   // ACK transmission is synchronous and can take longer than the 500 ms tone.
   // Start the timer only after that radio operation has finished.
   if (beepAfterPacketHandling) startMessageBeep();
@@ -569,7 +743,10 @@ bool sendPacket(const char *payload) {
   uint8_t frame[203] = { '<', 0xFF, 0x01 };
   memcpy(frame + 3, payload, payloadLen);
   int state = radio.transmit(frame, payloadLen + 3);
-  if (state == RADIOLIB_ERR_NONE) Serial.printf("TX: %s\n", payload);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.printf("TX: %s\n", payload);
+    sendOwnPacketToAprsIs(payload);
+  }
   else Serial.printf("TX fehlgeschlagen: %d\n", state);
   radio.startReceive();
   return state == RADIOLIB_ERR_NONE;
@@ -610,7 +787,7 @@ void maybeAckMessage(const char *packet, const char *info) {
   if (!source[0]) return;
 
   char ack[180];
-  snprintf(ack, sizeof(ack), "%s>APLTDP,%s::%-9.9s:ack%s", myCallsign, APRS_PATH, source, msgId);
+  snprintf(ack, sizeof(ack), "%s>%s,%s::%-9.9s:ack%s", myCallsign, APRS_TO_CALL, APRS_PATH, source, msgId);
   Serial.printf("  Sende ACK an %s fuer ID %s\n", source, msgId);
   sendPacket(ack);
 }
@@ -652,7 +829,7 @@ void sendBeacon(bool manual = false) {
     unsigned long altitudeFeet = min((unsigned long)999999, (unsigned long)lround(gps.altitude.meters() * 3.28084));
     snprintf(altitudeExtension, sizeof(altitudeExtension), "/A=%06lu", altitudeFeet);
   }
-  snprintf(packet, sizeof(packet), "%s>APLTDP,%s:=%s/%s%c%s%s%s", myCallsign, APRS_PATH,
+  snprintf(packet, sizeof(packet), "%s>%s,%s:=%s/%s%c%s%s%s", myCallsign, APRS_TO_CALL, APRS_PATH,
            lat, lon, stationSymbol, speedExtension, altitudeExtension, stationComment);
   bool positionSent = sendPacket(packet);
   if (positionSent) ++positionBeaconCount;
@@ -671,7 +848,7 @@ void sendBeacon(bool manual = false) {
       snprintf(statusText, sizeof(statusText), "%s", stationStatus);
     if (statusText[0]) {
       char statusPacket[140];
-      snprintf(statusPacket, sizeof(statusPacket), "%s>APLTDP,%s:>%s", myCallsign, APRS_PATH, statusText);
+      snprintf(statusPacket, sizeof(statusPacket), "%s>%s,%s:>%s", myCallsign, APRS_TO_CALL, APRS_PATH, statusText);
       sendPacket(statusPacket);
       Serial.printf("APRS-Status gesendet (Positionsbake %lu)\n", (unsigned long)positionBeaconCount);
     }
@@ -733,8 +910,8 @@ void sendMessage(char *line) {
   char packet[220];
   char id[8]; snprintf(id, sizeof(id), "%u", nextMessageId++);
   char text[150]; snprintf(text, sizeof(text), "%s{%s", body, id);
-  snprintf(packet, sizeof(packet), "%s>APLTDP,%s::%s:%s", myCallsign, APRS_PATH, padded, text);
-  storeMessage(target, text, true);
+  snprintf(packet, sizeof(packet), "%s>%s,%s::%s:%s", myCallsign, APRS_TO_CALL, APRS_PATH, padded, text);
+  storeMessage(target, text, true, currentGpsTimestamp());
   sendPacket(packet);
 }
 
@@ -750,6 +927,9 @@ void printGpsStatus() {
     Serial.printf(" | Fix: nein | letzte Positionsdaten %s\n",
       gps.location.isValid() ? "veraltet" : "keine");
   }
+  Serial.printf("GPS Parser: Zeichen %lu | NMEA OK %lu | Pruefsummenfehler %lu | Saetze mit Fix %lu\n",
+    (unsigned long)gps.charsProcessed(), (unsigned long)gps.passedChecksum(),
+    (unsigned long)gps.failedChecksum(), (unsigned long)gps.sentencesWithFix());
 }
 
 void handleCommand(char *line) {
@@ -771,6 +951,12 @@ void loadSettings() {
   if (wifiMode > WLAN_CLIENT) wifiMode = WLAN_OFF;
   s = prefs.getString("wifi_ssid", "TDeck-AP"); s.toCharArray(wifiSsid, sizeof(wifiSsid));
   s = prefs.getString("wifi_pass", ""); s.toCharArray(wifiPassword, sizeof(wifiPassword));
+  aprsIsEnabled = prefs.getBool("is_on", false);
+  aprsIsBeaconEnabled = prefs.getBool("is_beacon", false);
+  aprsIsRxGateEnabled = prefs.getBool("is_rxgate", true);
+  s = prefs.getString("is_host", "rotate.aprs2.net"); s.toCharArray(aprsIsServer, sizeof(aprsIsServer));
+  s = prefs.getString("is_pass", ""); s.toCharArray(aprsIsPasscode, sizeof(aprsIsPasscode));
+  aprsIsRadiusKm = constrain(prefs.getUChar("is_radius", 50), (uint8_t)1, (uint8_t)100);
   smartBeaconEnabled = prefs.getBool("sb_on", true);
   smartSlowRateMin = prefs.getUShort("sb_slow", 10);
   smartFastRateSec = prefs.getUShort("sb_fast", 60);
@@ -784,6 +970,9 @@ void loadSettings() {
   positionPrecision = min((uint8_t)4, prefs.getUChar("pos_precision", 0));
   messageToneEnabled = prefs.getBool("tone_on", true);
   batteryStatusEnabled = prefs.getBool("bat_status", false);
+  keyLockTimeoutSeconds = prefs.getUChar("keylock_sec", 0);
+  if (keyLockTimeoutSeconds != 0 && keyLockTimeoutSeconds != 10 && keyLockTimeoutSeconds != 20 &&
+      keyLockTimeoutSeconds != 30 && keyLockTimeoutSeconds != 60) keyLockTimeoutSeconds = 0;
   if (!myCallsign[0]) strcpy(myCallsign, DEFAULT_CALLSIGN);
   prefs.end();
 }
@@ -797,6 +986,12 @@ void saveSettings() {
   prefs.putUChar("wifi_mode", wifiMode);
   prefs.putString("wifi_ssid", wifiSsid);
   prefs.putString("wifi_pass", wifiPassword);
+  prefs.putBool("is_on", aprsIsEnabled);
+  prefs.putBool("is_beacon", aprsIsBeaconEnabled);
+  prefs.putBool("is_rxgate", aprsIsRxGateEnabled);
+  prefs.putString("is_host", aprsIsServer);
+  prefs.putString("is_pass", aprsIsPasscode);
+  prefs.putUChar("is_radius", aprsIsRadiusKm);
   prefs.putBool("sb_on", smartBeaconEnabled);
   prefs.putUShort("sb_slow", smartSlowRateMin);
   prefs.putUShort("sb_fast", smartFastRateSec);
@@ -810,6 +1005,7 @@ void saveSettings() {
   prefs.putUChar("pos_precision", positionPrecision);
   prefs.putBool("tone_on", messageToneEnabled);
   prefs.putBool("bat_status", batteryStatusEnabled);
+  prefs.putUChar("keylock_sec", keyLockTimeoutSeconds);
   prefs.end();
   Serial.printf("Einstellungen gespeichert: %s Symbol %c\n", myCallsign, stationSymbol);
 }
@@ -821,6 +1017,8 @@ const char *wifiModeName() {
 }
 
 void applyWifiMode() {
+  stopAprsIs();
+  aprsIsReconnectAt = 0;
   lastWifiStatus = -1;
   if (webServerStarted) {
     webServer.stop();
@@ -869,6 +1067,9 @@ void startSettingEdit() {
     case 11: snprintf(editBuffer, sizeof(editBuffer), "%u", smartTurnTimeSec); editLimit = 3; break;
     case 20: strncpy(editBuffer, wifiSsid, sizeof(editBuffer)); editLimit = 32; break;
     case 21: strncpy(editBuffer, wifiPassword, sizeof(editBuffer)); editLimit = 63; break;
+    case 25: strncpy(editBuffer, aprsIsServer, sizeof(editBuffer)); editLimit = sizeof(aprsIsServer) - 1; break;
+    case 26: strncpy(editBuffer, aprsIsPasscode, sizeof(editBuffer)); editLimit = 5; break;
+    case 27: snprintf(editBuffer, sizeof(editBuffer), "%u", aprsIsRadiusKm); editLimit = 3; break;
   }
   editBuffer[sizeof(editBuffer) - 1] = 0;
   uiDirty = true;
@@ -907,6 +1108,24 @@ void activateSetting() {
     batteryStatusEnabled = !batteryStatusEnabled;
     saveSettings();
     uiDirty = true;
+  } else if (settingsSelection == APRSIS_SETTING) {
+    aprsIsEnabled = !aprsIsEnabled;
+    saveSettings();
+    if (!aprsIsEnabled) stopAprsIs();
+    aprsIsReconnectAt = 0;
+    Serial.printf("APRS-IS %s\n", aprsIsEnabled ? "aktiviert" : "deaktiviert");
+    uiDirty = true;
+  } else if (settingsSelection == KEY_LOCK_SETTING) {
+    if (keyLockTimeoutSeconds == 0) keyLockTimeoutSeconds = 10;
+    else if (keyLockTimeoutSeconds == 10) keyLockTimeoutSeconds = 20;
+    else if (keyLockTimeoutSeconds == 20) keyLockTimeoutSeconds = 30;
+    else if (keyLockTimeoutSeconds == 30) keyLockTimeoutSeconds = 60;
+    else keyLockTimeoutSeconds = 0;
+    keyboardLocked = false;
+    keyLockSequenceStage = 0;
+    lastPhysicalInputAt = millis();
+    saveSettings();
+    uiDirty = true;
   } else {
     startSettingEdit();
   }
@@ -922,7 +1141,14 @@ void activateSelectedSetting() {
     }
     if (detailsSelection == 14) beaconSpeedEnabled = !beaconSpeedEnabled;
     else if (detailsSelection == 15) beaconAltitudeEnabled = !beaconAltitudeEnabled;
-    else positionPrecision = (positionPrecision + 1) % 5;
+    else if (detailsSelection == 16) positionPrecision = (positionPrecision + 1) % 5;
+    else if (detailsSelection == 17) aprsIsBeaconEnabled = !aprsIsBeaconEnabled;
+    else if (detailsSelection == 21) aprsIsRxGateEnabled = !aprsIsRxGateEnabled;
+    else {
+      settingsSelection = 25 + detailsSelection - 18;
+      startSettingEdit();
+      return;
+    }
     saveSettings();
     uiDirty = true;
     return;
@@ -946,6 +1172,20 @@ void commitEdit() {
       case 11: smartTurnTimeSec = constrain(atoi(editBuffer), 30, 180); break;
       case 20: strncpy(wifiSsid, editBuffer, sizeof(wifiSsid) - 1); wifiSsid[sizeof(wifiSsid) - 1] = 0; break;
       case 21: strncpy(wifiPassword, editBuffer, sizeof(wifiPassword) - 1); wifiPassword[sizeof(wifiPassword) - 1] = 0; break;
+      case 25: {
+        bool valid = editBuffer[0] != 0;
+        for (size_t i = 0; valid && editBuffer[i]; ++i)
+          if (!isalnum((unsigned char)editBuffer[i]) && editBuffer[i] != '-' && editBuffer[i] != '.') valid = false;
+        if (valid) { strncpy(aprsIsServer, editBuffer, sizeof(aprsIsServer) - 1); aprsIsServer[sizeof(aprsIsServer) - 1] = 0; }
+        break;
+      }
+      case 26: {
+        bool valid = true;
+        for (size_t i = 0; editBuffer[i]; ++i) if (!isdigit((unsigned char)editBuffer[i])) valid = false;
+        if (valid) { strncpy(aprsIsPasscode, editBuffer, sizeof(aprsIsPasscode) - 1); aprsIsPasscode[sizeof(aprsIsPasscode) - 1] = 0; }
+        break;
+      }
+      case 27: aprsIsRadiusKm = constrain(atoi(editBuffer), 1, 100); break;
     }
     if (smartHighSpeedKmh <= smartLowSpeedKmh)
       smartHighSpeedKmh = min((uint16_t)90, (uint16_t)(smartLowSpeedKmh + 1));
@@ -953,6 +1193,14 @@ void commitEdit() {
       smartFastRateSec = max((uint16_t)10, (uint16_t)(smartSlowRateMin * 60 - 1));
     saveSettings();
     if (settingsSelection == 20 || settingsSelection == 21) applyWifiMode();
+    if (settingsSelection == 0) {
+      stopAprsIs();
+      aprsIsReconnectAt = 0;
+    }
+    if (settingsSelection >= 25 && settingsSelection <= 27) {
+      stopAprsIs();
+      aprsIsReconnectAt = 0;
+    }
   }
   editMode = false; uiDirty = true;
 }
@@ -963,8 +1211,8 @@ bool transmitMessage(const char *target, const char *body) {
   memcpy(padded, target, min(strlen(target), (size_t)9));
   char id[8]; snprintf(id, sizeof(id), "%u", nextMessageId++);
   char text[150]; snprintf(text, sizeof(text), "%s{%s", body, id);
-  char packet[220]; snprintf(packet, sizeof(packet), "%s>APLTDP,%s::%s:%s", myCallsign, APRS_PATH, padded, text);
-  storeMessage(target, text, true);
+  char packet[220]; snprintf(packet, sizeof(packet), "%s>%s,%s::%s:%s", myCallsign, APRS_TO_CALL, APRS_PATH, padded, text);
+  storeMessage(target, text, true, currentGpsTimestamp());
   return sendPacket(packet);
 }
 
@@ -987,7 +1235,7 @@ void appendJsonString(String &out, const char *value) {
 
 void handleWebState() {
   String json;
-  json.reserve(7000);
+  json.reserve(50000);
   json += "{\"callsign\":"; appendJsonString(json, myCallsign);
   bool fix = gps.location.isValid() && gps.location.age() < GPS_STALE_MS;
   json += ",\"fix\":"; json += fix ? "true" : "false";
@@ -999,13 +1247,33 @@ void handleWebState() {
   json += ",\"batteryVoltage\":"; json += batteryReadingValid ? String(batteryVoltage, 2) : "null";
   json += ",\"batteryPercent\":"; json += batteryReadingValid ? String(batteryPercent) : "null";
   json += ",\"batteryStatusEnabled\":"; json += batteryStatusEnabled ? "true" : "false";
+  json += ",\"smartBeaconEnabled\":"; json += smartBeaconEnabled ? "true" : "false";
+  json += ",\"smartSlowRateMin\":"; json += smartSlowRateMin;
+  json += ",\"smartFastRateSec\":"; json += smartFastRateSec;
+  json += ",\"smartLowSpeedKmh\":"; json += smartLowSpeedKmh;
+  json += ",\"smartHighSpeedKmh\":"; json += smartHighSpeedKmh;
+  json += ",\"smartTurnAngleDeg\":"; json += smartTurnAngleDeg;
+  json += ",\"smartTurnSlope\":"; json += smartTurnSlope;
+  json += ",\"smartTurnTimeSec\":"; json += smartTurnTimeSec;
+  json += ",\"aprsIsEnabled\":"; json += aprsIsEnabled ? "true" : "false";
+  json += ",\"aprsIsBeaconEnabled\":"; json += aprsIsBeaconEnabled ? "true" : "false";
+  json += ",\"aprsIsRxGateEnabled\":"; json += aprsIsRxGateEnabled ? "true" : "false";
+  json += ",\"aprsIsServer\":"; appendJsonString(json, aprsIsServer);
+  json += ",\"aprsIsPasscodeSet\":"; json += aprsIsPasscode[0] ? "true" : "false";
+  json += ",\"aprsIsRadiusKm\":"; json += aprsIsRadiusKm;
+  json += ",\"aprsIsConnected\":"; json += aprsIsClient.connected() ? "true" : "false";
+  json += ",\"wifiMode\":"; json += wifiMode;
   IPAddress ip = wifiMode == WLAN_AP ? WiFi.softAPIP() : WiFi.localIP();
   json += ",\"ip\":"; appendJsonString(json, ip.toString().c_str());
   json += ",\"stations\":[";
-  for (int i = 0; i < stationCount; ++i) {
-    if (i) json += ',';
+  int stationOrder[MAX_STATIONS];
+  getStationOrderNewestFirst(stationOrder);
+  for (int rank = 0; rank < stationCount; ++rank) {
+    int i = stationOrder[rank];
+    if (rank) json += ',';
     json += "{\"call\":"; appendJsonString(json, stations[i].call);
     json += ",\"index\":"; json += i;
+    json += ",\"timestamp\":"; json += stations[i].timestamp ? String(stations[i].timestamp) : "null";
     json += ",\"lat\":"; json += stations[i].hasPos ? String(stations[i].lat, 6) : "null";
     json += ",\"lon\":"; json += stations[i].hasPos ? String(stations[i].lon, 6) : "null";
     json += ",\"distanceKm\":";
@@ -1025,6 +1293,7 @@ void handleWebState() {
     char visibleText[100]; copyMessageTextForDisplay(messages[i].text, visibleText, sizeof(visibleText));
     json += "{\"from\":"; appendJsonString(json, messages[i].from);
     json += ",\"index\":"; json += i;
+    json += ",\"timestamp\":"; json += messages[i].timestamp ? String(messages[i].timestamp) : "null";
     json += ",\"text\":"; appendJsonString(json, visibleText);
     json += ",\"outgoing\":"; json += messages[i].outgoing ? "true" : "false";
     json += ",\"acked\":"; json += messages[i].acked ? "true" : "false";
@@ -1059,6 +1328,86 @@ void handleWebSend() {
     webServer.send(503, "application/json; charset=utf-8", "{\"error\":\"Funkuebertragung fehlgeschlagen.\"}");
     return;
   }
+  webServer.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
+bool parseWebInt(const String &value, int minimum, int maximum, int &result) {
+  if (!value.length()) return false;
+  for (size_t i = 0; i < value.length(); ++i) if (!isDigit(value[i])) return false;
+  long parsed = value.toInt();
+  if (parsed < minimum || parsed > maximum) return false;
+  result = (int)parsed;
+  return true;
+}
+
+void handleWebSettings() {
+  wakeDisplay();
+  String sbEnabled = webServer.arg("smartBeaconEnabled");
+  String isEnabled = webServer.arg("aprsIsEnabled");
+  String isBeaconEnabled = webServer.arg("aprsIsBeaconEnabled");
+  String isRxGateEnabled = webServer.arg("aprsIsRxGateEnabled");
+  String host = webServer.arg("aprsIsServer");
+  String passcode = webServer.arg("aprsIsPasscode");
+  String clearPasscode = webServer.arg("clearPasscode");
+  host.trim();
+  if ((sbEnabled != "0" && sbEnabled != "1") ||
+      (isEnabled != "0" && isEnabled != "1") ||
+      (isBeaconEnabled != "0" && isBeaconEnabled != "1") ||
+      (isRxGateEnabled != "0" && isRxGateEnabled != "1")) {
+    webServer.send(400, "application/json; charset=utf-8", "{\"error\":\"Schalterwert ungueltig.\"}");
+    return;
+  }
+
+  int slow, fast, low, high, angle, slope, turnTime, radius;
+  bool numericValid = parseWebInt(webServer.arg("smartSlowRateMin"), 1, 100, slow) &&
+      parseWebInt(webServer.arg("smartFastRateSec"), 10, 180, fast) &&
+      parseWebInt(webServer.arg("smartLowSpeedKmh"), 2, 30, low) &&
+      parseWebInt(webServer.arg("smartHighSpeedKmh"), 3, 90, high) &&
+      parseWebInt(webServer.arg("smartTurnAngleDeg"), 5, 90, angle) &&
+      parseWebInt(webServer.arg("smartTurnSlope"), 1, 255, slope) &&
+      parseWebInt(webServer.arg("smartTurnTimeSec"), 30, 180, turnTime) &&
+      parseWebInt(webServer.arg("aprsIsRadiusKm"), 1, 100, radius);
+  bool hostValid = host.length() > 0 && host.length() < sizeof(aprsIsServer);
+  for (size_t i = 0; hostValid && i < host.length(); ++i)
+    if (!isalnum((unsigned char)host[i]) && host[i] != '-' && host[i] != '.') hostValid = false;
+  bool passcodeValid = passcode.length() <= 5;
+  for (size_t i = 0; passcodeValid && i < passcode.length(); ++i)
+    if (!isDigit(passcode[i])) passcodeValid = false;
+  if (!numericValid || high <= low || fast >= slow * 60 || !hostValid || !passcodeValid ||
+      (clearPasscode != "0" && clearPasscode != "1")) {
+    webServer.send(400, "application/json; charset=utf-8",
+      "{\"error\":\"Einstellungen pruefen: Wertebereiche, High > Low, Fast < Slow und gueltiger Server/Passcode.\"}");
+    return;
+  }
+
+  bool reconnectAprsIs = aprsIsEnabled != (isEnabled == "1") || strcmp(aprsIsServer, host.c_str()) != 0 ||
+      radius != aprsIsRadiusKm || (clearPasscode == "1" && aprsIsPasscode[0]) ||
+      (passcode.length() && passcode != aprsIsPasscode);
+  smartBeaconEnabled = sbEnabled == "1";
+  smartSlowRateMin = slow;
+  smartFastRateSec = fast;
+  smartLowSpeedKmh = low;
+  smartHighSpeedKmh = high;
+  smartTurnAngleDeg = angle;
+  smartTurnSlope = slope;
+  smartTurnTimeSec = turnTime;
+  aprsIsEnabled = isEnabled == "1";
+  aprsIsBeaconEnabled = isBeaconEnabled == "1";
+  aprsIsRxGateEnabled = isRxGateEnabled == "1";
+  strncpy(aprsIsServer, host.c_str(), sizeof(aprsIsServer) - 1);
+  aprsIsServer[sizeof(aprsIsServer) - 1] = 0;
+  if (clearPasscode == "1") aprsIsPasscode[0] = 0;
+  else if (passcode.length()) {
+    strncpy(aprsIsPasscode, passcode.c_str(), sizeof(aprsIsPasscode) - 1);
+    aprsIsPasscode[sizeof(aprsIsPasscode) - 1] = 0;
+  }
+  aprsIsRadiusKm = radius;
+  saveSettings();
+  if (reconnectAprsIs) {
+    stopAprsIs();
+    aprsIsReconnectAt = 0;
+  }
+  uiDirty = true;
   webServer.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
@@ -1132,6 +1481,7 @@ void configureWebRoutes() {
   webServer.on("/", HTTP_GET, []() { webServer.send_P(200, "text/html; charset=utf-8", WEB_PAGE); });
   webServer.on("/api/state", HTTP_GET, handleWebState);
   webServer.on("/api/send", HTTP_POST, handleWebSend);
+  webServer.on("/api/settings", HTTP_POST, handleWebSettings);
   webServer.on("/api/tone", HTTP_POST, handleWebTone);
   webServer.on("/api/battery-status", HTTP_POST, handleWebBatteryStatus);
   webServer.on("/api/message/delete", HTTP_POST, handleWebDeleteMessage);
@@ -1152,6 +1502,199 @@ void serviceWebServer() {
   if (webServerStarted) webServer.handleClient();
 }
 
+void stopAprsIs() {
+  bool wasConnected = aprsIsClient.connected();
+  if (wasConnected) {
+    aprsIsClient.stop();
+    Serial.println("APRS-IS Verbindung getrennt");
+  }
+  aprsIsRxLength = 0;
+  aprsIsDiscardLine = false;
+  aprsIsFilterLat = 999.0;
+  if (wasConnected && currentPage == 2) uiDirty = true;
+}
+
+bool sendAprsIsLine(const char *line) {
+  if (!aprsIsEnabled || wifiMode != WLAN_CLIENT || !aprsIsClient.connected()) return false;
+  if (!aprsIsPasscode[0]) {
+    static bool warnedReceiveOnly = false;
+    if (!warnedReceiveOnly) {
+      Serial.println("APRS-IS: ohne Passcode bleibt der Client empfangsbereit; Senden ist gesperrt");
+      warnedReceiveOnly = true;
+    }
+    return false;
+  }
+  if (strlen(line) > 510) return false;
+  aprsIsClient.print(line);
+  aprsIsClient.print("\r\n");
+  return true;
+}
+
+bool sendOwnPacketToAprsIs(const char *packet) {
+  const char *gt = strchr(packet, '>');
+  const char *colon = strchr(packet, ':');
+  if (!gt || !colon || gt > colon || (size_t)(gt - packet) >= 16) return false;
+  char source[16];
+  memcpy(source, packet, gt - packet);
+  source[gt - packet] = 0;
+  if (strcasecmp(source, myCallsign) != 0) return false;
+  // APRS-IS forwarding of position beacons and status is an independent opt-in.
+  // Keep message/ACK traffic available whenever the APRS-IS connection is enabled.
+  const char *information = colon + 1;
+  bool isBeacon = *information == '=' || *information == '!' || *information == '/' ||
+                  *information == '@' || *information == '>';
+  if (isBeacon && !aprsIsBeaconEnabled) {
+    Serial.println("APRS-IS: Positionsbake/Status nicht gesendet (\"Bake auch senden\" ist aus)");
+    return false;
+  }
+  const char *destinationEnd = gt + 1;
+  while (destinationEnd < colon && *destinationEnd != ',') ++destinationEnd;
+  size_t destinationLength = destinationEnd - (gt + 1);
+  if (!destinationLength || destinationLength > 9) return false;
+  char line[513];
+  int n = snprintf(line, sizeof(line), "%s>%.*s,TCPIP*:%s", myCallsign,
+                   (int)destinationLength, gt + 1, colon + 1);
+  if (n <= 0 || n >= (int)sizeof(line)) return false;
+  if (sendAprsIsLine(line)) {
+    Serial.printf("APRS-IS TX (%s): %s\n", isBeacon ? "eigene Bake" : "eigene Nachricht", line);
+    return true;
+  }
+  if (!aprsIsEnabled) Serial.println("APRS-IS: nicht gesendet (Verbindung ausgeschaltet)");
+  else if (wifiMode != WLAN_CLIENT) Serial.println("APRS-IS: nicht gesendet (Wireless muss auf Client stehen)");
+  else if (!aprsIsClient.connected()) Serial.println("APRS-IS: nicht gesendet (Serververbindung fehlt)");
+  else if (!aprsIsPasscode[0]) Serial.println("APRS-IS: nicht gesendet (Passcode fehlt; Empfang-only)");
+  else Serial.println("APRS-IS: Senden fehlgeschlagen");
+  return false;
+}
+
+void forwardLoRaPacketToAprsIs(const char *source, const char *gt, const char *colon) {
+  if (!aprsIsRxGateEnabled || !aprsIsEnabled || wifiMode != WLAN_CLIENT || !aprsIsClient.connected()) return;
+  if (!source[0] || strcasecmp(source, myCallsign) == 0 || !gt || !colon || gt >= colon) return;
+  const char *info = colon + 1;
+  if (*info == '}') return; // Never re-gate an APRS third-party packet.
+  char path[220];
+  size_t pathLength = colon - (gt + 1);
+  if (!pathLength || pathLength >= sizeof(path)) return;
+  memcpy(path, gt + 1, pathLength);
+  path[pathLength] = 0;
+  for (size_t i = 0; path[i]; ++i) path[i] = toupper((unsigned char)path[i]);
+  if (strstr(path, "TCPIP") || strstr(path, "TCPXX") || strstr(path, "NOGATE") ||
+      strstr(path, "RFONLY") || strstr(path, ",Q")) return;
+  char line[513];
+  int n = snprintf(line, sizeof(line), "%s>%.*s,qAR,%s:%s", source,
+                   (int)pathLength, gt + 1, myCallsign, info);
+  if (n > 0 && n < (int)sizeof(line) && sendAprsIsLine(line))
+    Serial.printf("APRS-IS TX (LoRa-Gateway): %s\n", line);
+}
+
+void processAprsIsLine(char *line) {
+  if (!line[0]) return;
+  if (line[0] == '#') {
+    Serial.printf("APRS-IS: %.110s\n", line);
+    return;
+  }
+  const char *gt = strchr(line, '>');
+  const char *colon = strchr(line, ':');
+  if (!gt || !colon || gt >= colon || gt - line < 3 || gt - line >= 16) return;
+  char source[16];
+  memcpy(source, line, gt - line);
+  source[gt - line] = 0;
+  if (strcasecmp(source, myCallsign) == 0) return;
+
+  char ownGate[28];
+  snprintf(ownGate, sizeof(ownGate), "qAR,%s", myCallsign);
+  if (strstr(gt + 1, ownGate) && strstr(gt + 1, ownGate) < colon) return;
+
+  const char *info = colon + 1;
+  double lat, lon;
+  bool hasPosition = extractPosition(info, lat, lon);
+  bool addressedToUs = false;
+  if (info[0] == ':' && strlen(info) > 11 && info[10] == ':') {
+    char target[10];
+    memcpy(target, info + 1, 9); target[9] = 0;
+    for (int i = 8; i >= 0 && target[i] == ' '; --i) target[i] = 0;
+    addressedToUs = strcasecmp(target, myCallsign) == 0;
+  }
+  if (!hasPosition && !addressedToUs) return;
+  showPacket(line, 0, 0.0f, true);
+}
+
+void serviceAprsIs() {
+  bool isConnected = aprsIsClient.connected();
+  if (isConnected != aprsIsUiConnected) {
+    aprsIsUiConnected = isConnected;
+    if (currentPage == 2) uiDirty = true;
+  }
+  bool networkAvailable = aprsIsEnabled && wifiMode == WLAN_CLIENT && WiFi.status() == WL_CONNECTED;
+  if (!networkAvailable) {
+    if (aprsIsClient.connected()) stopAprsIs();
+    return;
+  }
+
+  bool positionValid = gps.location.isValid() && gps.location.age() < GPS_STALE_MS;
+  if (aprsIsClient.connected() && positionValid && aprsIsFilterLat != 999.0) {
+    double movedKm = TinyGPSPlus::distanceBetween(aprsIsFilterLat, aprsIsFilterLon,
+                                                  gps.location.lat(), gps.location.lng()) / 1000.0;
+    const double moveThresholdKm = 1.0;
+    if (movedKm >= moveThresholdKm) {
+      Serial.println("APRS-IS Radiusfilter wird mit neuer GPS-Position aktualisiert");
+      stopAprsIs();
+      aprsIsReconnectAt = 0;
+    }
+  }
+
+  if (!aprsIsClient.connected()) {
+    uint32_t now = millis();
+    if ((int32_t)(now - aprsIsReconnectAt) < 0) return;
+    aprsIsReconnectAt = now + 10000;
+    if (!positionValid) {
+      if (now - aprsIsLastStatusAt > 30000) {
+        Serial.println("APRS-IS wartet auf aktuellen GPS-Fix fuer den Radiusfilter");
+        aprsIsLastStatusAt = now;
+      }
+      return;
+    }
+    Serial.printf("APRS-IS verbinde mit %s:14580\n", aprsIsServer);
+    aprsIsClient.setConnectionTimeout(5000);
+    if (!aprsIsClient.connect(aprsIsServer, 14580, 5000)) {
+      Serial.println("APRS-IS Verbindung fehlgeschlagen; neuer Versuch in 10 s");
+      return;
+    }
+    aprsIsClient.setNoDelay(true);
+    aprsIsFilterLat = gps.location.lat();
+    aprsIsFilterLon = gps.location.lng();
+    char login[220];
+    snprintf(login, sizeof(login), "user %s pass %s vers TDeckLoRa 1.0 filter r/%.5f/%.5f/%u",
+             myCallsign, aprsIsPasscode[0] ? aprsIsPasscode : "-1",
+             aprsIsFilterLat, aprsIsFilterLon, aprsIsRadiusKm);
+    aprsIsClient.print(login);
+    aprsIsClient.print("\r\n");
+    aprsIsReconnectAt = millis() + 10000;
+    Serial.printf("APRS-IS Anmeldung gesendet | Filter %u km | Passcode %s\n",
+                  aprsIsRadiusKm, aprsIsPasscode[0] ? "gesetzt" : "Empfang-only (-1)");
+    if (currentPage == 2) uiDirty = true;
+  }
+
+  uint16_t processed = 0;
+  while (aprsIsClient.connected() && aprsIsClient.available() && processed++ < 160) {
+    char c = (char)aprsIsClient.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (!aprsIsDiscardLine) {
+        aprsIsRxLine[aprsIsRxLength] = 0;
+        processAprsIsLine(aprsIsRxLine);
+      }
+      aprsIsRxLength = 0;
+      aprsIsDiscardLine = false;
+    } else if (aprsIsRxLength < sizeof(aprsIsRxLine) - 1) {
+      if (!aprsIsDiscardLine) aprsIsRxLine[aprsIsRxLength++] = c;
+    } else {
+      aprsIsRxLength = 0;
+      aprsIsDiscardLine = true;
+    }
+  }
+}
+
 void appendChar(char *dst, size_t cap, char c) {
   size_t n = strlen(dst);
   if (n + 1 < cap && isPrintable(c)) { dst[n] = c; dst[n + 1] = 0; }
@@ -1159,7 +1702,13 @@ void appendChar(char *dst, size_t cap, char c) {
 
 void handleKey(char key) {
   if (key == 0) return;
+  serviceKeyLock();
   wakeDisplay();
+  if (keyboardLocked) {
+    handleLockedKey(key);
+    return;
+  }
+  lastPhysicalInputAt = millis();
   if (composeStage) {
     char *target = composeStage == 1 ? composeTo : composeText;
     size_t cap = composeStage == 1 ? sizeof(composeTo) : sizeof(composeText);
@@ -1188,13 +1737,21 @@ void handleKey(char key) {
   } else if (currentPage == 1 && (key == 'r' || key == 'R')) {
     startReplyToSelectedMessage();
   } else if (currentPage == 1 && (key == 'd' || key == 'D') && messageCount) {
-    if (deleteMessageAt(messageSelection)) showUiNotice("Nachricht geloescht");
+    if (deleteMessageAt(messageCount - 1 - messageSelection)) showUiNotice("Nachricht geloescht");
   } else if (currentPage == 0 && (key == 'd' || key == 'D') && stationCount) {
-    if (deleteStationAt(stationSelection)) showUiNotice("Station geloescht");
+    int stationOrder[MAX_STATIONS]; getStationOrderNewestFirst(stationOrder);
+    if (deleteStationAt(stationOrder[stationSelection])) showUiNotice("Station geloescht");
   } else if (key >= '1' && key <= '4') { currentPage = key - '1'; uiDirty = true; }
 }
 
 void handleTrackball(int dx, int dy, bool click) {
+  serviceKeyLock();
+  if (keyboardLocked) {
+    keyLockSequenceStage = 0;
+    showKeyLockPrompt();
+    return;
+  }
+  lastPhysicalInputAt = millis();
   if (editMode) { if (click) commitEdit(); return; }
   if (composeStage) { if (click) { composeStage = 0; composeTo[0] = composeText[0] = 0; uiDirty = true; } return; }
   // Trackball sensors may emit a short burst of edges for one movement.
@@ -1265,7 +1822,14 @@ void pollTrackball() {
   if (clicks != handledClick) {
     wakeDisplay();
     handledClick = clicks;
-    if (!clickTracking) {
+    serviceKeyLock();
+    if (keyboardLocked) {
+      keyLockSequenceStage = 0;
+      showKeyLockPrompt();
+      clickTracking = false;
+      longPressHandled = true;
+    } else if (!clickTracking) {
+      lastPhysicalInputAt = millis();
       clickTracking = true;
       longPressHandled = false;
       clickStartedAt = millis();
@@ -1345,6 +1909,55 @@ void wakeDisplay() {
   }
 }
 
+void showKeyLockPrompt() {
+  wakeDisplay();
+  keyLockPromptUntil = millis() + 3000;
+  uiDirty = true;
+}
+
+void handleLockedKey(char key) {
+  uint32_t now = millis();
+  char normalized = (char)toupper((unsigned char)key);
+  showKeyLockPrompt();
+  if (keyLockSequenceStage == 1 && (int32_t)(now - keyLockSequenceDeadline) >= 0)
+    keyLockSequenceStage = 0;
+  if (keyLockSequenceStage == 0) {
+    if (normalized == 'A') {
+      keyLockSequenceStage = 1;
+      keyLockSequenceDeadline = now + 5000;
+    }
+  } else if (normalized == 'L') {
+    keyboardLocked = false;
+    keyLockSequenceStage = 0;
+    keyLockPromptUntil = 0;
+    lastPhysicalInputAt = now;
+    Serial.println("Tastensperre entsperrt");
+  } else {
+    keyLockSequenceStage = 0;
+  }
+  uiDirty = true;
+}
+
+void serviceKeyLock() {
+  uint32_t now = millis();
+  if (!keyboardLocked && keyLockTimeoutSeconds &&
+      (uint32_t)(now - lastPhysicalInputAt) >= (uint32_t)keyLockTimeoutSeconds * 1000UL) {
+    keyboardLocked = true;
+    keyLockSequenceStage = 0;
+    keyLockPromptUntil = now + 3000;
+    uiDirty = true;
+    Serial.printf("Tastensperre aktiv nach %u s\n", keyLockTimeoutSeconds);
+  }
+  if (keyLockSequenceStage == 1 && (int32_t)(now - keyLockSequenceDeadline) >= 0) {
+    keyLockSequenceStage = 0;
+    uiDirty = true;
+  }
+  if (keyLockPromptUntil && (int32_t)(now - keyLockPromptUntil) >= 0) {
+    keyLockPromptUntil = 0;
+    uiDirty = true;
+  }
+}
+
 uint8_t batteryPercentFromVoltage(float voltage) {
   static const uint16_t millivolts[] = {3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 4000, 4100, 4200};
   static const uint8_t percentages[] = {0, 5, 10, 20, 30, 40, 50, 60, 75, 90, 100};
@@ -1401,10 +2014,12 @@ void drawStations() {
     display->setTextColor(C_WHITE, C_BG); display->setCursor(20, 95); display->setTextSize(2);
     display->print("Warte auf Stationen...");
   }
+  int order[MAX_STATIONS]; getStationOrderNewestFirst(order);
   int first = stationSelection > 6 ? stationSelection - 6 : 0;
   for (int row = 0; row < 7 && first + row < stationCount; ++row) {
-    int i = first + row; int y = 62 + row * 21;
-    bool selected = i == stationSelection;
+    int rank = first + row;
+    int i = order[rank]; int y = 62 + row * 21;
+    bool selected = rank == stationSelection;
     if (selected) display->fillRoundRect(4, y - 2, 312, 19, 3, C_PANEL);
     display->setTextSize(1); display->setTextColor(selected ? C_YELLOW : C_WHITE, selected ? C_PANEL : C_BG);
     display->setCursor(9, y); display->print(stations[i].call);
@@ -1431,15 +2046,21 @@ void drawMessages() {
   drawHeader("Nachrichten");
   display->setTextSize(1); display->setTextColor(C_MUTED, C_BG); display->setCursor(8, 43);
   display->print("Klick/R: Antwort | d: loeschen | Enter/m: neu");
-  int first = messageSelection > 4 ? messageSelection - 4 : 0;
-  for (int row = 0; row < 5 && first + row < messageCount; ++row) {
-    int i = first + row; int y = 61 + row * 22; AprsMessage &m = messages[i];
-    if (i == messageSelection && !composeStage) display->fillRoundRect(4, y - 2, 312, 20, 3, C_PANEL);
-    display->setTextColor(m.outgoing ? C_CYAN : C_WHITE, i == messageSelection && !composeStage ? C_PANEL : C_BG);
+  int first = messageSelection > 3 ? messageSelection - 3 : 0;
+  for (int row = 0; row < 4 && first + row < messageCount; ++row) {
+    int rank = first + row;
+    int i = messageCount - 1 - rank;
+    int y = 58 + row * 28; AprsMessage &m = messages[i];
+    if (rank == messageSelection && !composeStage) display->fillRoundRect(4, y - 2, 312, 27, 3, C_PANEL);
+    display->setTextColor(m.outgoing ? C_CYAN : C_WHITE, rank == messageSelection && !composeStage ? C_PANEL : C_BG);
     display->setCursor(8, y); display->printf("%c %s", m.outgoing ? '>' : '<', m.from);
+    char stamp[20]; formatCompactUtcTimestamp(m.timestamp, stamp, sizeof(stamp));
+    display->setTextColor(C_MUTED, rank == messageSelection && !composeStage ? C_PANEL : C_BG);
+    display->setCursor(198, y); display->print(stamp);
     char visibleText[100]; copyMessageTextForDisplay(m.text, visibleText, sizeof(visibleText));
-    display->setCursor(112, y); display->printf("%.24s", visibleText);
-    if (m.outgoing) { display->setCursor(284, y); display->setTextColor(m.acked ? C_GREEN : C_YELLOW, i == messageSelection && !composeStage ? C_PANEL : C_BG); display->print(m.acked ? "ACK" : "..."); }
+    display->setTextColor(m.outgoing ? C_CYAN : C_WHITE, rank == messageSelection && !composeStage ? C_PANEL : C_BG);
+    display->setCursor(8, y + 11); display->printf("%.48s", visibleText);
+    if (m.outgoing) { display->setCursor(284, y); display->setTextColor(m.acked ? C_GREEN : C_YELLOW, rank == messageSelection && !composeStage ? C_PANEL : C_BG); display->print(m.acked ? "ACK" : "..."); }
   }
   if (composeStage) {
     display->fillRect(0, 174, 320, 40, C_PANEL);
@@ -1460,7 +2081,8 @@ void drawSettings() {
     "Slow rate min", "Fast rate s", "Low speed km/h", "High speed km/h",
     "Turn angle deg", "Turn slope", "Turn time s", "Telefon /$", "Auto />",
     "Van /v", "LKW /k", "Mensch /[", "Trecker /F", "Schiff /s",
-    "Wireless", "WLAN SSID", "WLAN Passwort", "Nachrichtenton", "Akku im Status"
+    "Wireless", "WLAN SSID", "WLAN Passwort", "Nachrichtenton", "Akku im Status", "APRS-IS",
+    "", "", "", "Tastensperre"
   };
   uint8_t first = settingsMenuSelection > 4 ? settingsMenuSelection - 4 : 0;
   for (int row = 0; row < 5 && first + row < MAIN_SETTING_COUNT; ++row) {
@@ -1483,6 +2105,15 @@ void drawSettings() {
       case 21: display->print(wifiPassword[0] ? "********" : "(leer)"); break;
       case 22: display->print(messageToneEnabled ? "AN" : "AUS"); break;
       case 23: display->print(batteryStatusEnabled ? "AN" : "AUS"); break;
+      case APRSIS_SETTING:
+        if (!aprsIsEnabled) display->print("AUS");
+        else if (wifiMode != WLAN_CLIENT) display->print("WLAN Client!");
+        else display->print(aprsIsClient.connected() ? "Online" : "AN");
+        break;
+      case KEY_LOCK_SETTING:
+        if (!keyLockTimeoutSeconds) display->print("Off");
+        else display->printf("%u s", keyLockTimeoutSeconds);
+        break;
       default: display->print(stationSymbol == presetSymbolCode(i) ? "AKTIV" : "setzen"); break;
     }
     if (i == 19) {
@@ -1516,18 +2147,19 @@ void drawDetails() {
     "Slow rate min", "Fast rate s", "Low speed km/h", "High speed km/h",
     "Turn angle deg", "Turn slope", "Turn time s", "Telefon /$", "Auto />",
     "Van /v", "LKW /k", "Mensch /[", "Trecker /F", "Schiff /s",
-    "Tempo", "Hoehe", "Genauigkeit"
+    "Tempo", "Hoehe", "Genauigkeit", "Bake auch senden", "Server", "Passcode", "Umkreis km", "RX-Gate"
   };
-  uint8_t section = detailsSelection < 7 ? 0 : (detailsSelection < 14 ? 1 : 2);
-  uint8_t sectionStart = section == 0 ? 0 : (section == 1 ? 7 : 14);
-  uint8_t sectionCount = section == 2 ? 3 : 7;
+  uint8_t section = detailsSelection < 7 ? 0 : (detailsSelection < 14 ? 1 : (detailsSelection < 17 ? 2 : 3));
+  uint8_t sectionStart = section == 0 ? 0 : (section == 1 ? 7 : (section == 2 ? 14 : 17));
+  uint8_t sectionCount = section < 2 ? 7 : (section == 2 ? 3 : 5);
   uint8_t groupSelection = detailsSelection - sectionStart;
   uint8_t first = groupSelection > 4 ? groupSelection - 4 : 0;
   display->setTextSize(1); display->setTextColor(C_CYAN, C_BG);
   display->setCursor(8, 43);
   if (section == 0) display->print("SmartBeaconing:");
   else if (section == 1) display->print("APRS Symbol:");
-  else display->print("Positionsgenauigkeit:");
+  else if (section == 2) display->print("Positionsgenauigkeit:");
+  else display->print("APRS-IS:");
   for (int row = 0; row < 5 && first + row < sectionCount; ++row) {
     uint8_t item = sectionStart + first + row;
     int y = 61 + row * 26;
@@ -1549,15 +2181,25 @@ void drawDetails() {
     } else if (section == 1) {
       uint8_t setting = 5 + item;
       display->print(stationSymbol == presetSymbolCode(setting) ? "AKTIV" : "setzen");
-    } else if (item == 14) {
+    } else if (section == 2 && item == 14) {
       display->print(beaconSpeedEnabled ? "Ja" : "Nein");
-    } else if (item == 15) {
+    } else if (section == 2 && item == 15) {
       display->print(beaconAltitudeEnabled ? "Ja" : "Nein");
-    } else {
+    } else if (section == 2) {
       static const char *precisionLabels[] = {
         "DD\xB0 MM.mm'", "DD\xB0 MM.m'", "DD\xB0 MM'", "DD\xB0 Mx'", "DD\xB0"
       };
       display->print(precisionLabels[positionPrecision]);
+    } else if (item == 17) {
+      display->print(aprsIsBeaconEnabled ? "Ja" : "Nein");
+    } else if (item == 18) {
+      display->printf("%.25s", aprsIsServer);
+    } else if (item == 19) {
+      display->print(aprsIsPasscode[0] ? "*****" : "(leer)");
+    } else if (item == 20) {
+      display->printf("%u km", aprsIsRadiusKm);
+    } else {
+      display->print(aprsIsRxGateEnabled ? "Ja" : "Nein");
     }
     if (editMode && selected) {
       display->setTextColor(C_CYAN, C_PANEL); display->setCursor(157, y + 15);
@@ -1579,6 +2221,18 @@ void drawUi() {
     display->fillRoundRect(56, 178, 208, 30, 5, C_GREEN);
     display->setTextSize(2); display->setTextColor(C_WHITE, C_GREEN);
     display->setCursor(77, 185); display->print(uiNotice);
+  }
+  if (keyboardLocked && keyLockPromptUntil && (int32_t)(millis() - keyLockPromptUntil) < 0) {
+    display->fillRoundRect(24, 80, 272, 82, 8, C_PANEL);
+    display->drawRoundRect(24, 80, 272, 82, 8, C_CYAN);
+    display->setTextSize(2); display->setTextColor(C_YELLOW, C_PANEL);
+    display->setCursor(57, 91); display->print("Tastatur gesperrt");
+    display->setTextSize(1); display->setTextColor(C_WHITE, C_PANEL);
+    display->setCursor(99, 122); display->print("Entsperren: A + L");
+    if (keyLockSequenceStage == 1) {
+      display->setTextColor(C_CYAN, C_PANEL);
+      display->setCursor(88, 140); display->print("Jetzt L innerhalb 5 s");
+    }
   }
   uiDirty = false;
 }
@@ -1639,6 +2293,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_TRACK_CLICK), onTrackClick, FALLING);
   // T-Deck Plus MIA-M10Q UART: GPS TX -> ESP32 GPIO44 (RX), GPS RX <- GPIO43 (TX).
   gpsSerial.begin(38400, SERIAL_8N1, 44, 43);
+  Serial.printf("GPS UART gestartet: RX=44 TX=43 @ 38400 Baud\n");
   Serial.printf("LoRa APRS | %s | %.3f MHz | SF%u/BW%.0f\n", myCallsign, LORA_MHZ, LORA_SF, LORA_BW_KHZ);
   // RadioLib 8.x takes a ConfigLoRa_t object. Frequencies/bandwidth are Hz.
   ConfigLoRa_t loraConfig;
@@ -1655,6 +2310,7 @@ void setup() {
   configureWebRoutes();
   applyWifiMode();
   Serial.println("LoRa APRS bereit. Trackball links/rechts wechselt Seiten; Tastatur bedient Eingaben.");
+  lastPhysicalInputAt = millis();
   uiDirty = true; drawUi();
   printGpsStatus();
 }
@@ -1662,6 +2318,7 @@ void setup() {
 void loop() {
   if (millis() - lastBatteryRead >= 5000) updateBatteryReading();
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  serviceKeyLock();
   pollKeyboard();
   pollTrackball();
   if (wifiMode == WLAN_CLIENT) {
@@ -1699,6 +2356,7 @@ void loop() {
   serviceMessageBeep();
   serviceBeaconing();
   serviceWebServer();
+  serviceAprsIs();
   if (millis() - lastFooterUpdate >= 1000) {
     lastFooterUpdate = millis();
     updateFooter();
